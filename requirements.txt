@@ -1,0 +1,15 @@
+# Coeur du projet (mode petit corpus, character-level)
+torch
+tqdm
+matplotlib
+
+# Mode grand corpus (BPE + streaming)
+numpy
+tokenizers
+
+# Téléchargement en streaming depuis Hugging Face (--source dans download_corpus.py)
+datasets
+
+# Interface graphique
+streamlit
+pandas
