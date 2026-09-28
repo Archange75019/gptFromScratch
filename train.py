@@ -18,10 +18,12 @@ Le script :
 """
 
 import argparse
+import math
 import time
 import json
 import os
 import shutil
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -115,6 +117,32 @@ class BinDataset:
         return np.memmap(self.path, dtype=self.dtype, mode="r")
 
 
+def get_lr(step, base_lr, warmup_steps, total_steps, min_ratio):
+    """Warmup linéaire puis décroissance cosinus jusqu'à base_lr * min_ratio.
+
+    Indispensable dès qu'on dépasse quelques millions de paramètres : un LR
+    constant et fort dès le step 0 fait diverger (ou stagner) un modèle plus profond.
+    """
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    if step >= total_steps:
+        return base_lr * min_ratio
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return base_lr * (min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
+
+
+def build_optimizer(model, lr, weight_decay):
+    """AdamW (betas 0.9/0.95 comme LLaMA/GPT-3). Le weight decay ne s'applique
+    qu'aux matrices (dim >= 2) : pas aux poids de RMSNorm (vecteurs 1D)."""
+    decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    no_decay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))
+
+
 def get_device():
     if torch.cuda.is_available():
         return "cuda"
@@ -144,14 +172,16 @@ def get_batch(data: BinDataset, block_size, batch_size, device):
 
 
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, block_size, batch_size, device, eval_iters=50):
+def estimate_loss(model, train_data, val_data, block_size, batch_size, device, eval_iters=50, amp_ctx=None):
+    amp_ctx = amp_ctx if amp_ctx is not None else nullcontext()
     out = {}
     model.eval()
     for split, data in [("train", train_data), ("val", val_data)]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x, y = get_batch(data, block_size, batch_size, device)
-            _, loss = model(x, y)
+            with amp_ctx:
+                _, loss = model(x, y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
@@ -167,8 +197,22 @@ def main():
     parser.add_argument("--n_layer", type=int, default=4)
     parser.add_argument("--n_head", type=int, default=4)
     parser.add_argument("--n_embd", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--dropout", type=float, default=0.0,
+                        help="0.0 par défaut (style LLaMA) ; 0.05-0.1 si le corpus est petit devant le modèle.")
+    parser.add_argument("--lr", type=float, default=6e-4, help="LR max (atteint après le warmup).")
+    parser.add_argument("--warmup_steps", type=int, default=200)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
+                        help="LR final = lr * min_lr_ratio (décroissance cosinus).")
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Accumulation de gradients : batch effectif = batch_size * grad_accum, "
+                             "sans utiliser plus de mémoire.")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Précision mixte bfloat16 (cuda/xpu uniquement) : ~2x plus rapide et moins de mémoire.")
+    parser.add_argument("--tie_embeddings", action="store_true",
+                        help="Partage les poids embedding/lm_head (économise vocab_size*n_embd paramètres).")
+    parser.add_argument("--flash_attn", action="store_true",
+                        help="Attention via F.scaled_dot_product_attention (plus rapide, même résultat).")
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--eval_interval", type=int, default=250)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -219,10 +263,16 @@ def main():
             n_head=args.n_head,
             n_embd=args.n_embd,
             dropout=args.dropout,
+            tie_embeddings=args.tie_embeddings,
+            flash_attn=args.flash_attn,
         )
 
     model = MiniGPT(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    amp_ctx = (torch.autocast(device_type=device, dtype=torch.bfloat16)
+               if args.bf16 and device in ("cuda", "xpu") else nullcontext())
+    tokens_per_step = args.batch_size * args.grad_accum * config.block_size
+    print(f"Tokens par step : {tokens_per_step:,} (batch {args.batch_size} x accum {args.grad_accum} x contexte {config.block_size})")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -257,7 +307,7 @@ def main():
     progress = trange(start_step, args.steps + 1, desc="Entraînement", unit="step")
     for step in progress:
         if step % args.eval_interval == 0 or step == args.steps:
-            losses = estimate_loss(model, train_data, val_data, args.block_size, args.batch_size, device)
+            losses = estimate_loss(model, train_data, val_data, config.block_size, args.batch_size, device, amp_ctx=amp_ctx)
             elapsed = time.time() - t0
             progress.write(
                 f"step {step:5d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f} | {elapsed:.1f}s"
@@ -271,14 +321,22 @@ def main():
 
             live_window.update(history)
 
-        x, y = get_batch(train_data, args.block_size, args.batch_size, device)
-        _, loss = model(x, y)
+        lr_now = get_lr(step, args.lr, args.warmup_steps, args.steps, args.min_lr_ratio)
+        for group in optimizer.param_groups:
+            group["lr"] = lr_now
+
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_value = 0.0
+        for _ in range(args.grad_accum):
+            x, y = get_batch(train_data, config.block_size, args.batch_size, device)
+            with amp_ctx:
+                _, loss = model(x, y)
+            (loss / args.grad_accum).backward()
+            loss_value += loss.item() / args.grad_accum
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        progress.set_postfix(loss=f"{loss.item():.4f}")  # affiché en continu, coût ~nul
+        progress.set_postfix(loss=f"{loss_value:.4f}", lr=f"{lr_now:.1e}")
 
     live_window.close()
     print("Entraînement terminé. Checkpoint dans:", args.out_dir)

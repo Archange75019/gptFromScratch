@@ -29,11 +29,6 @@ import streamlit as st
 PROJECT_DIR = Path(__file__).parent
 PYTHON = sys.executable
 
-# Force tous les sous-processus (train.py, generate.py, etc.) à utiliser
-# l'UTF-8 pour leur entrée/sortie, indépendamment de l'encodage par défaut
-# de la console Windows (cp1252) -- sinon un simple print() d'un caractère
-# accentué "exotique" (nom propre étranger généré par le modèle, etc.)
-# peut faire planter le sous-processus.
 import os
 SUBPROCESS_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
@@ -188,7 +183,7 @@ with tab_train:
             lr = st.select_slider(
                 "Learning rate",
                 options=[1e-4, 3e-4, 6e-4, 1e-3, 3e-3],
-                value=3e-4,
+                value=6e-4,
                 format_func=lambda x: f"{x:.0e}",
                 disabled=is_running,
             )
@@ -199,10 +194,13 @@ with tab_train:
             n_embd = st.slider("Dimension d'embedding (n_embd)", 32, 512, 128, step=32, disabled=is_running)
             block_size = st.slider("Longueur de contexte (block_size)", 32, 512, 256, step=32, disabled=is_running)
             batch_size = st.slider("Batch size", 8, 128, 64, step=8, disabled=is_running)
-            dropout = st.slider("Dropout", 0.0, 0.5, 0.1, step=0.05, disabled=is_running)
+            dropout = st.slider("Dropout", 0.0, 0.5, 0.0, step=0.05, disabled=is_running)
 
         if n_embd % n_head != 0:
             st.error(f"n_embd ({n_embd}) doit être divisible par n_head ({n_head}).")
+            valid_config = False
+        elif (n_embd // n_head) % 2 != 0:
+            st.error(f"n_embd / n_head = {n_embd // n_head} doit être pair (exigence de RoPE).")
             valid_config = False
         else:
             valid_config = True

@@ -7,6 +7,7 @@ Usage :
 """
 
 import argparse
+import dataclasses
 import json
 import os
 
@@ -38,11 +39,10 @@ def main():
 
     with open(os.path.join(args.checkpoint_dir, "config.json")) as f:
         config_dict = json.load(f)
-        # Filtrer pour ne garder que les champs attendus par GPTConfig
-        filtered_config = {
-            k: v for k, v in config_dict.items()
-            if k in ["vocab_size", "block_size", "n_layer", "n_head", "n_embd", "dropout"]
-        }
+        # Filtrer pour ne garder que les champs connus de GPTConfig (générique :
+        # suit automatiquement les nouveaux champs ajoutés à la config)
+        known = {f.name for f in dataclasses.fields(GPTConfig)}
+        filtered_config = {k: v for k, v in config_dict.items() if k in known}
         config = GPTConfig(**filtered_config)
 
     tokenizer = BPETokenizer.load(os.path.join(args.checkpoint_dir, "tokenizer.json"))

@@ -9,12 +9,10 @@ Usage :
 
 import argparse
 import json
-import math
 import os
 
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
 
 from model import MiniGPT, GPTConfig
 from tokenizer import BPETokenizer
@@ -22,25 +20,16 @@ from train import get_device
 
 
 def get_attention_weights(model, idx, layer_idx):
-    """Refait manuellement le calcul d'attention du bloc `layer_idx` pour en extraire les poids."""
-    block = model.blocks[layer_idx]
-    attn = block.attn
+    """Poids d'attention (B, n_head, T, T) de la couche `layer_idx`.
 
-    x = model.token_embedding(idx) + model.position_embedding(torch.arange(idx.size(1), device=idx.device))
+    On fait tourner les blocs précédents normalement, puis on demande au bloc
+    cible ses poids d'attention (RoPE inclus) : plus de calcul recopié à la main.
+    """
+    x = model.token_embedding(idx)
     for i in range(layer_idx):
-        x = model.blocks[i](x)
-    x_norm = block.ln1(x)
-
-    B, T, C = x_norm.shape
-    qkv = attn.qkv_proj(x_norm)
-    q, k, v = qkv.split(C, dim=2)
-    q = q.view(B, T, attn.n_head, attn.head_dim).transpose(1, 2)
-    k = k.view(B, T, attn.n_head, attn.head_dim).transpose(1, 2)
-
-    att_scores = (q @ k.transpose(-2, -1)) / math.sqrt(attn.head_dim)
-    att_scores = att_scores.masked_fill(attn.causal_mask[:, :, :T, :T] == 0, float("-inf"))
-    att_weights = F.softmax(att_scores, dim=-1)
-    return att_weights  # (B, n_head, T, T)
+        x = model.blocks[i](x, model.rope_cos, model.rope_sin)
+    block = model.blocks[layer_idx]
+    return block.attn.attention_weights(block.ln1(x), model.rope_cos, model.rope_sin)
 
 
 def main():
